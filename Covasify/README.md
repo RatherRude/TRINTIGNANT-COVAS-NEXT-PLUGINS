@@ -104,7 +104,7 @@ Voice-controlled Spotify integration for COVAS NEXT. Play music, control playbac
 - Say the phrase again if needed (plugin overrides COVAS safety protocols but may need retry on first attempt)
 
 **Need to re-authorize**
-- Delete `.spotify_cache` from plugin folder
+- Delete the OAuth cache (e.g. `_spotify_cache` in the plugin’s data folder under COVAS `plugin_data`, or the file/folder in your plugin folder if you’re on an older install)
 - Restart COVAS - browser will open for re-auth on first command
 
 ## What's NOT Possible
@@ -120,10 +120,10 @@ Due to Spotify API restrictions (November 2024):
 Covasify/
   - Covasify.py              # Main plugin
   - manifest.json            # Plugin metadata
-  - spotify_bindings.json    # Your bindings (auto-created)
-  - .spotify_cache           # OAuth tokens (auto-created)
   - deps/                    # Bundled dependencies
 ```
+
+**Persistent data** (bindings and OAuth token cache) is stored in COVAS:NEXT’s plugin data folder (by plugin GUID), not inside the plugin folder. That way your bindings and login survive when you update or replace the plugin. To re-authorize, remove the token cache from that data folder or use the Troubleshooting steps below.
 
 ## Version History
 **v3.0.0** - Re-worked by Lag0matic and AI to function again!

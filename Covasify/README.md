@@ -1,4 +1,5 @@
-# Covasify v2.0.0
+# Covasify v3.0.0
+NOTE: This was essentially re-written using Claude/ChatGPT(Colpilot). I - Lag0matic -barely know python, and there may be bugs or flaws.
 
 Voice-controlled Spotify integration for COVAS NEXT. Play music, control playback, and bind tracks to custom voice commands.
 
@@ -20,6 +21,7 @@ Voice-controlled Spotify integration for COVAS NEXT. Play music, control playbac
 2. Create an app with these settings:
    - **Redirect URI**: `http://127.0.0.1:8888/callback`
 3. Copy your **Client ID** and **Client Secret**
+4. Click the "USER MANAGEMENT" Tab at the top. Add your name and spotify email (I could not get it to work without this. Perhaps an update to spotify?)
 
 ### 2. Install Plugin
 
@@ -124,7 +126,7 @@ Covasify/
 ```
 
 ## Version History
-
+**v3.0.0** - Re-worked by Lag0matic and AI to function again! 
 **v2.0.0** - Settings UI integration, credential management via COVAS NEXT menu  
 **v1.0.0** - Initial release
 

@@ -127,7 +127,9 @@ Covasify/
 
 ## Version History
 **v3.0.0** - Re-worked by Lag0matic and AI to function again!
+
 **v2.0.0** - Settings UI integration, credential management via COVAS NEXT menu  
+
 **v1.0.0** - Initial release
 
 ## Credits

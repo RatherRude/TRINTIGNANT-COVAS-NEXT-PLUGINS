@@ -1,4 +1,4 @@
-from typing import override
+from typing_extensions import override
 import json
 import os
 import sys
@@ -7,6 +7,42 @@ import re  # For time parsing
 import time
 import threading
 from datetime import datetime
+from pydantic import BaseModel
+from typing import Optional
+import webbrowser
+
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import threading
+import urllib.parse as urlparse
+
+class SpotifyAuthCallbackHandler(BaseHTTPRequestHandler):
+    auth_code = None
+
+    def do_GET(self):
+        parsed = urlparse.urlparse(self.path)
+        params = urlparse.parse_qs(parsed.query)
+
+        if "code" in params:
+            SpotifyAuthCallbackHandler.auth_code = params["code"][0]
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h2>Spotify authentication successful!</h2>You may close this window.</body></html>")
+        else:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(b"Missing code parameter")
+
+    def log_message(self, format, *args):
+        return  # silence HTTP server logs
+        
+def start_spotify_callback_server():
+    server = HTTPServer(("127.0.0.1", 8888), SpotifyAuthCallbackHandler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    return server
 
 # Set up deps path BEFORE importing spotipy (like Songbird does with deps)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -18,13 +54,35 @@ if deps_path not in sys.path:
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
-from lib.PluginHelper import PluginHelper, PluginManifest
+from lib.PluginHelper import PluginHelper
 from lib.PluginSettingDefinitions import PluginSettings, SettingsGrid, TextSetting, ToggleSetting
 from lib.Logger import log
 from lib.EventManager import Projection
-from lib.PluginBase import PluginBase
+from lib.PluginBase import PluginBase, PluginManifest
 from lib.Event import Event
+class EmptyParams(BaseModel):
+    pass
 
+class QueryParams(BaseModel):
+    query: str
+
+class QueryShuffleParams(BaseModel):
+    query: str
+    shuffle: Optional[bool] = True
+
+class QueryNoShuffleParams(BaseModel):
+    query: str
+    shuffle: Optional[bool] = False
+
+class ControlParams(BaseModel):
+    command: str
+    value: Optional[int] = None
+
+class SeekParams(BaseModel):
+    time_input: str
+
+class PhraseParams(BaseModel):
+    phrase: str
 # ============================================================================
 # RELIABILITY CLIENT - Caching System (from Covinance v7.6)
 # ============================================================================
@@ -156,58 +214,61 @@ class ReliabilityClient:
             }
 
 # Main plugin class
-class COVASIFY(PluginBase):
+class COVASIFYPlugin(PluginBase):
+    # SETTINGS MUST BE HERE — CLASS LEVEL, NOT IN __init__
+    settings_config = PluginSettings(
+        key="COVASIFYPlugin",
+        label="Covasify Spotify Integration",
+        icon="music_note",
+        grids=[
+            SettingsGrid(
+                key="spotify_credentials",
+                label="Spotify API Credentials",
+                fields=[
+                    TextSetting(
+                        key="client_id",
+                        label="Client ID",
+                        type="text",
+                        readonly=False,
+                        placeholder="Your Spotify Client ID",
+                        default_value=""
+                    ),
+                    TextSetting(
+                        key="client_secret",
+                        label="Client Secret",
+                        type="text",
+                        readonly=False,
+                        placeholder="Your Spotify Client Secret",
+                        default_value=""
+                    ),
+                    TextSetting(
+                        key="redirect_uri",
+                        label="Redirect URI",
+                        type="text",
+                        readonly=False,
+                        placeholder="http://127.0.0.1:8888/callback",
+                        default_value="http://127.0.0.1:8888/callback"
+                    )
+                ]
+            )
+        ]
+    )
+    @override
+    def get_settings_config(self):
+        return self.settings_config
+
     def __init__(self, plugin_manifest: PluginManifest):
         super().__init__(plugin_manifest)
         
-        # Initialize reliability client for caching (1 hour TTL)
         self.reliability_client = ReliabilityClient()
-        
-        # Spotify client
         self.sp = None
-        
-        # Track currently playing track info for binding
         self.current_track_info = None
-        
-        # Settings UI for Spotify credentials
-        self.settings_config: PluginSettings | None = PluginSettings(
-            key="COVASIFYPlugin",
-            label="Covasify Spotify Integration",
-            icon="music_note",
-            grids=[
-                SettingsGrid(
-                    key="spotify_credentials",
-                    label="Spotify API Credentials",
-                    fields=[
-                        TextSetting(
-                            key="client_id",
-                            label="Client ID",
-                            type="text",
-                            readonly=False,
-                            placeholder="Your Spotify Client ID",
-                            default_value=""
-                        ),
-                        TextSetting(
-                            key="client_secret",
-                            label="Client Secret",
-                            type="text",
-                            readonly=False,
-                            placeholder="Your Spotify Client Secret",
-                            default_value=""
-                        ),
-                        TextSetting(
-                            key="redirect_uri",
-                            label="Redirect URI",
-                            type="text",
-                            readonly=False,
-                            placeholder="http://127.0.0.1:8888/callback",
-                            default_value="http://127.0.0.1:8888/callback"
-                        )
-                    ]
-                )
-            ]
-        )
-    
+        self.settings = {}
+
+    def on_settings_changed(self, settings: dict):
+        self.settings = settings
+
+
     def normalize_phrase(self, phrase: str) -> str:
         """Normalize phrase for matching: lowercase + strip punctuation + trim whitespace"""
         if not phrase:
@@ -218,273 +279,41 @@ class COVASIFY(PluginBase):
         return ' '.join(cleaned.lower().split())
     
     @override
-    def register_actions(self, helper: PluginHelper):
-        helper.register_action(
-            'covasify_test', 
-            "Test the Covasify plugin functionality.", 
-            {
-                "type": "object",
-                "properties": {}
-            }, 
-            self.covasify_test, 
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_play_track',
-            "Search for a track on Spotify and play it.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The song name, artist, or search query"
-                    }
-                },
-                "required": ["query"]
-            },
-            self.covasify_play_track,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_control',
-            "Control Spotify streaming playback. Use this to: pause or resume music, skip to next track or song, go back to previous track or song, restart current song from the beginning, stop playback entirely, increase or decrease volume, set volume to specific percentage, mute audio, enable or disable shuffle mode, enable or disable repeat mode.",
-            {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Control command: pause, resume, play, next, previous, skip, back, restart, stop, volume_up, volume_down, volume_set, mute, unmute, shuffle_on, shuffle_off, repeat_track, repeat_context, repeat_off"
-                    },
-                    "value": {
-                        "type": "integer",
-                        "description": "Value for volume_set command (0-100)"
-                    }
-                },
-                "required": ["command"]
-            },
-            self.covasify_control,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_seek',
-            "Seek to a specific position in the currently playing track. Accepts natural time formats like '2:30' or total seconds.",
-            {
-                "type": "object",
-                "properties": {
-                    "time_input": {
-                        "type": "string",
-                        "description": "Time position to seek to. Can be 'MM:SS' format (e.g., '2:30'), 'H:MM:SS' format (e.g., '1:15:30'), or total seconds (e.g., '150')"
-                    }
-                },
-                "required": ["time_input"]
-            },
-            self.covasify_seek,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_current',
-            "Get information about the currently playing track on Spotify: track name, artist, album.",
-            {
-                "type": "object",
-                "properties": {}
-            },
-            self.covasify_current,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_play_playlist',
-            "Play a Spotify playlist by name. Can play user's playlists, Liked Songs, or search public playlists. Supports shuffle mode.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Playlist name to search for, or 'liked songs' for user's saved tracks"
-                    },
-                    "shuffle": {
-                        "type": "boolean",
-                        "description": "Whether to shuffle the playlist (default: true)"
-                    }
-                },
-                "required": ["query"]
-            },
-            self.covasify_play_playlist,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_play_artist',
-            "Play music from an artist on Spotify. Uses artist context so Spotify naturally queues their full discography with shuffle. Perfect for 'play [artist]' requests.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Artist name"
-                    },
-                    "shuffle": {
-                        "type": "boolean",
-                        "description": "Whether to shuffle the artist's music (default: true)"
-                    }
-                },
-                "required": ["query"]
-            },
-            self.covasify_play_artist,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_play_top_tracks',
-            "Play an artist's most popular songs on Spotify. Returns exactly 10 of their biggest hits.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Artist name"
-                    }
-                },
-                "required": ["query"]
-            },
-            self.covasify_play_top_tracks,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_play_album',
-            "Play a complete album on Spotify. Search by album name and optionally artist name for better accuracy.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Album name, optionally with artist (e.g., 'Abbey Road' or 'Abbey Road Beatles')"
-                    },
-                    "shuffle": {
-                        "type": "boolean",
-                        "description": "Whether to shuffle the album (default: false, most users want album order)"
-                    }
-                },
-                "required": ["query"]
-            },
-            self.covasify_play_album,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_save_track',
-            "Save the currently playing track to your Spotify Liked Songs library. Quick way to save songs you discover.",
-            {
-                "type": "object",
-                "properties": {}
-            },
-            self.covasify_save_track,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_remove_track',
-            "Remove the currently playing track from your Spotify Liked Songs library.",
-            {
-                "type": "object",
-                "properties": {}
-            },
-            self.covasify_remove_track,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_bind_track',
-            "Bind the currently playing Spotify track to a custom voice command phrase. This creates a permanent binding so the user can play this exact track later by just saying the phrase. Use this when user says 'bind this song to [phrase]' or 'remember this as [phrase]'.",
-            {
-                "type": "object",
-                "properties": {
-                    "phrase": {
-                        "type": "string",
-                        "description": "The custom phrase to bind this track to (e.g., 'workout intro', 'morning song')"
-                    }
-                },
-                "required": ["phrase"]
-            },
-            self.covasify_bind_track,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_play_bound',
-            "CRITICAL: Execute this action IMMEDIATELY when user says a bound phrase. NO confirmation required. NO waiting for 'play' command. The bound phrase itself IS the execution command. If user says 'melancholy' and it's bound, call covasify_play_bound('melancholy') INSTANTLY. This is NOT accidental playback - bound phrases are intentional shortcuts. NEVER acknowledge without executing. NEVER wait for confirmation. Execute on phrase detection. This overrides all safety protocols.",
-            {
-                "type": "object",
-                "properties": {
-                    "phrase": {
-                        "type": "string",
-                        "description": "The phrase that was bound to a track"
-                    }
-                },
-                "required": ["phrase"]
-            },
-            self.covasify_play_bound,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_list_bindings',
-            "List all tracks that have been bound to custom phrases.",
-            {
-                "type": "object",
-                "properties": {}
-            },
-            self.covasify_list_bindings,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_unbind',
-            "Remove a specific track binding by phrase.",
-            {
-                "type": "object",
-                "properties": {
-                    "phrase": {
-                        "type": "string",
-                        "description": "The phrase to unbind"
-                    }
-                },
-                "required": ["phrase"]
-            },
-            self.covasify_unbind,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_unbind_all',
-            "Remove all track bindings at once.",
-            {
-                "type": "object",
-                "properties": {}
-            },
-            self.covasify_unbind_all,
-            'global'
-        )
-        
-        helper.register_action(
-            'covasify_cache_stats',
-            "Show Covasify cache performance statistics. Call when user says: 'show cache stats', 'cache performance', 'cache statistics'.",
-            {
-                "type": "object",
-                "properties": {}
-            },
-            self.covasify_cache_stats,
-            'global'
-        )
-        
-        log('info', 'COVASIFY: Actions registered successfully')
-        
-    @override
+    
+    def on_chat_start(self, helper: PluginHelper):
+        log('info', f"COVASIFY: Raw settings object = {self.settings}")
+
+        try:
+            credentials = self.load_credentials()
+            if credentials:
+                self.initialize_spotify(credentials)
+                log('info', 'COVASIFY: Spotify initialized successfully')
+
+            helper.register_action('covasify_test', "Test Covasify functionality", EmptyParams, self.covasify_test, 'global')
+            helper.register_action('covasify_play_track', "Search for a track on Spotify and play it.", QueryParams, self.covasify_play_track, 'global')
+            helper.register_action(
+                'covasify_control',
+                "Control Spotify playback: pause, resume, next, previous, restart, stop, volume_up, volume_down, volume_set, mute, unmute, shuffle_on, shuffle_off, repeat_track, repeat_context, repeat_off.",
+                ControlParams, self.covasify_control, 'global'
+            )
+            helper.register_action('covasify_seek', "Seek to a position in the current track. Accepts 'MM:SS', 'H:MM:SS', or total seconds.", SeekParams, self.covasify_seek, 'global')
+            helper.register_action('covasify_current', "Get info about the currently playing Spotify track.", EmptyParams, self.covasify_current, 'global')
+            helper.register_action('covasify_play_playlist', "Play a Spotify playlist by name, or 'liked songs' for saved tracks.", QueryShuffleParams, self.covasify_play_playlist, 'global')
+            helper.register_action('covasify_play_artist', "Play music from an artist on Spotify.", QueryShuffleParams, self.covasify_play_artist, 'global')
+            helper.register_action('covasify_play_top_tracks', "Play an artist's top 10 most popular tracks.", QueryParams, self.covasify_play_top_tracks, 'global')
+            helper.register_action('covasify_play_album', "Play a complete album on Spotify.", QueryNoShuffleParams, self.covasify_play_album, 'global')
+            helper.register_action('covasify_save_track', "Save the currently playing track to Liked Songs.", EmptyParams, self.covasify_save_track, 'global')
+            helper.register_action('covasify_remove_track', "Remove the currently playing track from Liked Songs.", EmptyParams, self.covasify_remove_track, 'global')
+            helper.register_action('covasify_bind_track', "Bind the currently playing track to a custom voice phrase.", PhraseParams, self.covasify_bind_track, 'global')
+            helper.register_action('covasify_play_bound', "Play the track bound to a given phrase.", PhraseParams, self.covasify_play_bound, 'global')
+            helper.register_action('covasify_list_bindings', "List all phrase-to-track bindings.", EmptyParams, self.covasify_list_bindings, 'global')
+            helper.register_action('covasify_unbind', "Remove a specific phrase binding.", PhraseParams, self.covasify_unbind, 'global')
+            helper.register_action('covasify_unbind_all', "Remove all phrase bindings.", EmptyParams, self.covasify_unbind_all, 'global')
+            helper.register_action('covasify_cache_stats', "Show Covasify cache statistics.", EmptyParams, self.covasify_cache_stats, 'global')
+            log('info', 'COVASIFY: Actions registered successfully')
+        except Exception as e:
+            log('error', f'COVASIFY: Failed during chat start: {str(e)}')
+
     def register_projections(self, helper: PluginHelper):
         pass
 
@@ -554,13 +383,6 @@ class COVASIFY(PluginBase):
     @override
     def on_plugin_helper_ready(self, helper: PluginHelper):
         log('info', 'COVASIFY: Plugin helper is ready')
-        
-        # Load credentials and initialize Spotify (like Songbird loads API key)
-        credentials = self.load_credentials(helper)
-        if credentials:
-            self.initialize_spotify(credentials)
-        else:
-            log('warning', 'COVASIFY: No credentials found')
     
     @override
     def on_chat_stop(self, helper: PluginHelper):
@@ -580,88 +402,122 @@ class COVASIFY(PluginBase):
                 pass
         return ""
 
-    def load_credentials(self, helper: PluginHelper = None) -> dict:
-        """
-        Load Spotify credentials from Settings UI first, then fall back to file.
-        Backwards compatible with spotify_credentials.txt
-        """
+    def load_credentials(self) -> dict:
         try:
-            # Try to load from Settings UI first (if helper available)
-            if helper:
-                log('info', 'COVASIFY: Attempting to read credentials from Settings UI')
-                client_id = helper.get_plugin_setting('COVASIFYPlugin', 'spotify_credentials', 'client_id')
-                client_secret = helper.get_plugin_setting('COVASIFYPlugin', 'spotify_credentials', 'client_secret')
-                redirect_uri = helper.get_plugin_setting('COVASIFYPlugin', 'spotify_credentials', 'redirect_uri')
-                
-                # Debug logging
-                log('info', f'COVASIFY: Settings read - client_id: {client_id[:10] if client_id else None}..., client_secret: {client_secret[:10] if client_secret else None}..., redirect_uri: {redirect_uri}')
-                
-                # If settings have credentials, use them
-                if client_id and client_secret:
-                    log('info', 'COVASIFY: Credentials loaded from Settings UI')
-                    return {
-                        'CLIENT_ID': client_id,
-                        'CLIENT_SECRET': client_secret,
-                        'REDIRECT_URI': redirect_uri if redirect_uri else 'http://127.0.0.1:8888/callback'
-                    }
-                else:
-                    log('warning', f'COVASIFY: Settings UI credentials incomplete - client_id: {bool(client_id)}, client_secret: {bool(client_secret)}')
-            
-            # Fall back to file-based credentials
+            log('info', 'COVASIFY: Attempting to read credentials from Settings UI')
+
+            # Settings are FLAT — not nested under "spotify_credentials"
+            client_id = self.settings.get('client_id')
+            client_secret = self.settings.get('client_secret')
+            redirect_uri = self.settings.get('redirect_uri')
+
+            log(
+                'info',
+                f"COVASIFY: Settings read — client_id={client_id[:10] if client_id else None}..., "
+                f"client_secret={client_secret[:10] if client_secret else None}..., "
+                f"redirect_uri={redirect_uri}"
+            )
+
+            # If UI settings are complete, use them
+            if client_id and client_secret:
+                log('info', 'COVASIFY: Credentials loaded from Settings UI')
+                return {
+                    'CLIENT_ID': client_id,
+                    'CLIENT_SECRET': client_secret,
+                    'REDIRECT_URI': redirect_uri or 'http://127.0.0.1:8888/callback'
+                }
+
+            log('warning', 'COVASIFY: Settings UI incomplete — falling back to spotify_credentials.txt')
+
+            # --- Fallback to file ---
             plugin_folder = self.get_plugin_folder_path()
             cred_file = os.path.join(plugin_folder, 'spotify_credentials.txt')
-            
+
             if not os.path.exists(cred_file):
                 log('error', 'COVASIFY: No credentials found in Settings UI or spotify_credentials.txt')
                 return None
-            
+
             credentials = {}
             with open(cred_file, 'r', encoding='utf-8') as f:
                 for line in f:
-                    line = line.strip()
                     if '=' in line and not line.startswith('#'):
                         key, value = line.split('=', 1)
                         credentials[key.strip()] = value.strip()
-            
+
             if 'CLIENT_ID' in credentials and 'CLIENT_SECRET' in credentials:
                 log('info', 'COVASIFY: Credentials loaded from spotify_credentials.txt (fallback)')
-                # Add default redirect URI if not in file
-                if 'REDIRECT_URI' not in credentials:
-                    credentials['REDIRECT_URI'] = 'http://127.0.0.1:8888/callback'
+                credentials.setdefault('REDIRECT_URI', 'http://127.0.0.1:8888/callback')
                 return credentials
-            else:
-                log('error', 'COVASIFY: Invalid credentials format in spotify_credentials.txt')
-                return None
-                
+
+            log('error', 'COVASIFY: Invalid credentials format in spotify_credentials.txt')
+            return None
+
         except Exception as e:
             log('error', f'COVASIFY: Error loading credentials: {str(e)}')
             return None
+
+
     def initialize_spotify(self, credentials: dict):
-        """Initialize Spotify client with OAuth (like Songbird initializes pygame)"""
         try:
             log('info', f"COVASIFY: Initializing Spotify with Client ID: {credentials['CLIENT_ID'][:10]}...")
             plugin_folder = self.get_plugin_folder_path()
             cache_path = os.path.join(plugin_folder, '_spotify_cache')
-            log('info', f'COVASIFY: Cache path: {cache_path}')
-            log('info', f'COVASIFY: Cache exists: {os.path.exists(cache_path)}')
-            
+
             auth_manager = SpotifyOAuth(
                 client_id=credentials['CLIENT_ID'],
                 client_secret=credentials['CLIENT_SECRET'],
                 redirect_uri=credentials.get('REDIRECT_URI', 'http://127.0.0.1:8888/callback'),
                 scope='user-read-playback-state user-modify-playback-state user-read-currently-playing user-library-read user-library-modify user-top-read playlist-read-private playlist-read-collaborative',
-                cache_path=cache_path
+                cache_path=cache_path,
+                open_browser=False
             )
-            log('info', 'COVASIFY: SpotifyOAuth manager created')
-            
+
+            # Check if we already have a valid cached token
+            token_info = auth_manager.get_cached_token()
+
+            if not (token_info and not auth_manager.is_token_expired(token_info)):
+                # Need fresh auth - reset class-level auth code first
+                SpotifyAuthCallbackHandler.auth_code = None
+
+                server = start_spotify_callback_server()
+                log('info', "COVASIFY: Local OAuth callback server started on 127.0.0.1:8888")
+
+                auth_url = auth_manager.get_authorize_url()
+                log('info', f"COVASIFY: Opening browser for Spotify auth: {auth_url}")
+                webbrowser.open(auth_url)
+
+                log('info', "COVASIFY: Waiting for Spotify authorization code...")
+                timeout = 120
+                elapsed = 0
+                while SpotifyAuthCallbackHandler.auth_code is None and elapsed < timeout:
+                    time.sleep(0.1)
+                    elapsed += 0.1
+
+                if SpotifyAuthCallbackHandler.auth_code is None:
+                    log('error', 'COVASIFY: Timed out waiting for Spotify auth code')
+                    server.shutdown()
+                    return False
+
+                code = SpotifyAuthCallbackHandler.auth_code
+                log('info', f"COVASIFY: Received Spotify auth code: {code[:10]}...")
+                server.shutdown()
+                log('info', "COVASIFY: OAuth callback server shut down")
+
+                token_info = auth_manager.get_access_token(code, as_dict=True)
+                if not token_info:
+                    log('error', 'COVASIFY: Failed to exchange auth code for token')
+                    return False
+            else:
+                log('info', 'COVASIFY: Valid cached token found, skipping OAuth flow')
+            log('info', "COVASIFY: Access token obtained and cached")
+
+            # Create Spotify client
             self.sp = spotipy.Spotify(auth_manager=auth_manager)
-            log('info', 'COVASIFY: Spotify client created, testing connection...')
-            
-            # Test connection - this will trigger OAuth flow if no valid cache
             user = self.sp.current_user()
             log('info', f"COVASIFY: Connected to Spotify as {user['display_name']}")
+
             return True
-            
+
         except Exception as e:
             log('error', f'COVASIFY: Failed to initialize Spotify: {str(e)}')
             self.sp = None
@@ -716,15 +572,15 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify. Check credentials."
             
-            query = args.get('query', '')
+            query = args.query
             if not query:
                 return "COVASIFY: No search query provided."
             
             log('info', f'COVASIFY: Searching for track: {query}')
             
-            # Search for track with caching
+            # Search for track with caching - fetch multiple for better matching
             def search_track(endpoint, params):
-                return self.sp.search(q=params['q'], type='track', limit=1)
+                return self.sp.search(q=params['q'], type='track', limit=10)
             
             results = self.reliability_client.get_cached_or_fetch(
                 'spotify_search_track',
@@ -735,24 +591,40 @@ class COVASIFY(PluginBase):
             if not results['tracks']['items']:
                 return f"COVASIFY: No tracks found for '{query}'."
             
-            track = results['tracks']['items'][0]
+            # Pick best match by scoring each result against the query
+            query_lower = query.lower()
+            query_words = set(query_lower.split())
+
+            def score_track(t):
+                name = t['name'].lower()
+                artist = t['artists'][0]['name'].lower()
+                combined = f"{name} {artist}"
+                combined_words = set(combined.split())
+                overlap = len(query_words & combined_words)
+                exact = 2 if query_lower in combined else 0
+                length_diff = abs(len(name) - len(query_lower))
+                return overlap + exact - (length_diff * 0.05)
+
+            track = max(results['tracks']['items'], key=score_track)
             track_name = track['name']
             artist_name = track['artists'][0]['name']
             track_uri = track['uri']
             album_uri = track['album']['uri']
+            log('info', f"COVASIFY: Best match: '{track_name}' by {artist_name}")
             
             # Get available devices
             devices = self.sp.devices()
             if not devices['devices']:
                 return "COVASIFY: No active Spotify devices found. Open Spotify on a device first."
             
-            # Play track within album context so next/previous work
             device_id = devices['devices'][0]['id']
+            self.sp.transfer_playback(device_id, force_play=True)
             self.sp.start_playback(
-                device_id=device_id, 
+                device_id=device_id,
                 context_uri=album_uri,
                 offset={"uri": track_uri}
-            )
+)
+
             
             # Update current track info for binding
             self.update_current_track_info()
@@ -770,7 +642,7 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            command = args.get('command', '').lower()
+            command = args.command.lower()
             
             log('info', f'COVASIFY: Control command: {command}')
             
@@ -830,7 +702,7 @@ class COVASIFY(PluginBase):
                 return "COVASIFY: No active playback to adjust volume."
                 
             elif command in ['volume_set', 'set_volume']:
-                value = args.get('value', 50)
+                value = args.value if args.value is not None else 50
                 value = max(0, min(100, value))
                 self.sp.volume(value)
                 log('info', f'COVASIFY: Volume set to {value}%')
@@ -919,7 +791,7 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            time_input = args.get('time_input', '').strip()
+            time_input = args.time_input.strip()
             
             if not time_input:
                 return "COVASIFY: No time position provided."
@@ -1018,8 +890,8 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            query = args.get('query', '').lower()
-            shuffle = args.get('shuffle', True)
+            query = args.query.lower()
+            shuffle = args.shuffle
             
             if not query:
                 return "COVASIFY: No playlist name provided."
@@ -1093,8 +965,8 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            query = args.get('query', '')
-            shuffle = args.get('shuffle', True)
+            query = args.query
+            shuffle = args.shuffle
             
             if not query:
                 return "COVASIFY: No artist provided."
@@ -1151,7 +1023,7 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            query = args.get('query', '')
+            query = args.query
             if not query:
                 return "COVASIFY: No artist provided."
             
@@ -1210,8 +1082,8 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            query = args.get('query', '')
-            shuffle = args.get('shuffle', False)  # Default false - most people want album order
+            query = args.query
+            shuffle = args.shuffle  # Default false - most people want album order
             
             if not query:
                 return "COVASIFY: No album name provided."
@@ -1220,6 +1092,9 @@ class COVASIFY(PluginBase):
             
             # Get available devices
             devices = self.sp.devices()
+            log('info', f"COVASIFY: Available devices: {devices['devices']}")
+
+
             if not devices['devices']:
                 return "COVASIFY: No active Spotify devices found. Open Spotify on a device first."
             
@@ -1369,11 +1244,10 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            phrase = args.get('phrase', '')
+            phrase = args.phrase
             if not phrase:
                 return "COVASIFY: No phrase provided."
             
-            # Normalize phrase (lowercase + strip punctuation)
             normalized_phrase = self.normalize_phrase(phrase)
             
             if not normalized_phrase:
@@ -1415,7 +1289,7 @@ class COVASIFY(PluginBase):
             if not self.sp:
                 return "COVASIFY: Not connected to Spotify."
             
-            phrase = args.get('phrase', '')
+            phrase = args.phrase
             if not phrase:
                 return "COVASIFY: No phrase provided."
             
@@ -1484,7 +1358,7 @@ class COVASIFY(PluginBase):
     def covasify_unbind(self, args, projected_states) -> str:
         """Remove a specific track binding"""
         try:
-            phrase = args.get('phrase', '')
+            phrase = args.phrase
             if not phrase:
                 return "COVASIFY: No phrase provided."
             

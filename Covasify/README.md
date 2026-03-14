@@ -15,6 +15,8 @@ Voice-controlled Spotify integration for COVAS NEXT. Play music, control playbac
 
 ## Installation
 
+**First time?** See **[SETUP.md](SETUP.md)** for exactly what to enter for Client ID, Client Secret, and Redirect URI in the COVAS client.
+
 ### 1. Get Spotify API Credentials
 
 1. Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
@@ -31,7 +33,7 @@ Voice-controlled Spotify integration for COVAS NEXT. Play music, control playbac
 
 3. Open COVAS NEXT menu → Navigate to **Covasify Spotify Integration** settings
 
-4. Enter your credentials:
+4. Enter your credentials (see **[SETUP.md](SETUP.md)** for step-by-step “what do I enter?”):
    - **Client ID**: Paste your Spotify Client ID
    - **Client Secret**: Paste your Spotify Client Secret
    - **Redirect URI**: Leave as default `http://127.0.0.1:8888/callback`
